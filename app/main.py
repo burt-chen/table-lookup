@@ -6,6 +6,7 @@ Reuses ``app.core`` for all data processing. Threading is plain
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import traceback
 from datetime import datetime
@@ -89,6 +90,7 @@ class FilePickerRow(ttk.Frame):
         self.status_lbl = ttk.Label(self, textvariable=self.status_var, foreground="#1976d2", width=14)
         self.status_lbl.pack(side="left", padx=(8, 0))
         self._sheet_was_enabled = False
+        self.last_error: str | None = None
 
     def _browse(self):
         try:
@@ -115,7 +117,7 @@ class FilePickerRow(ttk.Frame):
             try:
                 sheets = list_sheets(path)
             except Exception as e:
-                sheet_err = f"{type(e).__name__}: {e}"
+                sheet_err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
         if sheets:
             self.sheet_cb.configure(values=sheets, state="readonly")
             self.sheet_cb.set(sheets[0])
@@ -123,10 +125,22 @@ class FilePickerRow(ttk.Frame):
             placeholder = "(JSON)" if ext == ".json" else "(CSV)" if ext == ".csv" else ""
             self.sheet_cb.configure(values=[placeholder] if placeholder else [], state="disabled")
             self.sheet_var.set(placeholder)
+        self.last_error = sheet_err  # 給父層讀取
         if sheet_err is not None:
-            self.status_var.set("讀取工作表失敗")
-            messagebox.showerror("讀取工作表失敗", sheet_err)
-            return  # 別觸發後續載入,避免重複錯誤
+            # 寫到一個固定路徑的 debug 檔,絕對看得到
+            try:
+                debug_log = Path.home() / "table_lookup_debug.log"
+                with open(debug_log, "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"\n=== {_dt.now().isoformat(timespec='seconds')} list_sheets failed ===\n")
+                    f.write(f"path = {path}\n")
+                    f.write(f"sys.path:\n")
+                    for p in sys.path:
+                        f.write(f"  {p}\n")
+                    f.write(f"\nerror:\n{sheet_err}\n")
+            except Exception:
+                pass
+            self.status_var.set("讀取失敗(看下方錯誤)")
         self._fire(sheet_only=False)
 
     def _fire(self, sheet_only: bool):
@@ -993,6 +1007,18 @@ class MainWindow:
         idx = 1 if picker is self.picker1 else 2
         path = picker.path()
         if not path or not Path(path).exists():
+            return
+        # 若 list_sheets 同步失敗,先把錯誤寫進日誌讓使用者看得到
+        if picker.last_error:
+            self._log(f"【來源 {idx} list_sheets 失敗】")
+            for line in picker.last_error.splitlines():
+                self._log(f"  {line}")
+            self._log(f"完整錯誤也寫入: {Path.home() / 'table_lookup_debug.log'}")
+            # 自動切到日誌分頁讓使用者看到
+            try:
+                self.notebook.select(3)
+            except Exception:
+                pass
             return
         self._invalidate_preview()
         self._load_gen[idx] += 1
