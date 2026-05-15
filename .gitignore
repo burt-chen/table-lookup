@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+*.xlsx
+*.csv
+*.xml
+build_log.txt
+outputs.json
+settings.json
