@@ -131,6 +131,9 @@ class FilePickerRow(ttk.Frame):
         if name and name in self.sheet_cb["values"]:
             self.sheet_var.set(name)
 
+    def set_loaded(self, n_rows: int):
+        self.status_var.set(f"✓ {n_rows:,} 列")
+
     def set_loading(self, busy: bool, text: str = "讀取中…"):
         self.status_var.set(text if busy else "")
         if busy:
@@ -1003,6 +1006,7 @@ class MainWindow:
             return
         picker = self.picker1 if idx == 1 else self.picker2
         picker.set_loading(False)
+        picker.set_loaded(len(df))
         cols = [str(c) for c in df.columns]
         if idx == 1:
             self._df1 = df
@@ -1024,6 +1028,11 @@ class MainWindow:
         self.status_var.set("待命")
         self._log(f"來源 {idx} 載入完成:{len(df)} 列、{len(cols)} 欄")
         self._refresh_tab_gating()
+        if self._df1 is not None and self._df2 is not None:
+            try:
+                self.notebook.select(1)
+            except Exception:
+                pass
 
     def _on_load_failed(self, idx: int, gen: int, msg: str):
         if gen != self._load_gen.get(idx):
