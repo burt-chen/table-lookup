@@ -91,22 +91,31 @@ class FilePickerRow(ttk.Frame):
         self._sheet_was_enabled = False
 
     def _browse(self):
-        start = str(Path(self.path_var.get()).parent) if self.path_var.get() else ""
-        path = filedialog.askopenfilename(
-            title="選擇檔案",
-            initialdir=start,
-            filetypes=[
-                ("資料檔", "*.xlsx *.xlsm *.xls *.csv *.json"),
-                ("所有檔案", "*.*"),
-            ],
-        )
-        if path:
-            self.set_path(path)
+        try:
+            start = str(Path(self.path_var.get()).parent) if self.path_var.get() else ""
+            path = filedialog.askopenfilename(
+                title="選擇檔案",
+                initialdir=start,
+                filetypes=[
+                    ("資料檔", "*.xlsx *.xlsm *.xls *.csv *.json"),
+                    ("所有檔案", "*.*"),
+                ],
+            )
+            if path:
+                self.set_path(path)
+        except Exception as e:
+            messagebox.showerror("選檔失敗", f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
 
     def set_path(self, path: str):
         self.path_var.set(path)
-        sheets = list_sheets(path) if path else []
         ext = Path(path).suffix.lower() if path else ""
+        sheets: list[str] = []
+        sheet_err: str | None = None
+        if path and ext in (".xlsx", ".xlsm"):
+            try:
+                sheets = list_sheets(path)
+            except Exception as e:
+                sheet_err = f"{type(e).__name__}: {e}"
         if sheets:
             self.sheet_cb.configure(values=sheets, state="readonly")
             self.sheet_cb.set(sheets[0])
@@ -114,6 +123,10 @@ class FilePickerRow(ttk.Frame):
             placeholder = "(JSON)" if ext == ".json" else "(CSV)" if ext == ".csv" else ""
             self.sheet_cb.configure(values=[placeholder] if placeholder else [], state="disabled")
             self.sheet_var.set(placeholder)
+        if sheet_err is not None:
+            self.status_var.set("讀取工作表失敗")
+            messagebox.showerror("讀取工作表失敗", sheet_err)
+            return  # 別觸發後續載入,避免重複錯誤
         self._fire(sheet_only=False)
 
     def _fire(self, sheet_only: bool):
