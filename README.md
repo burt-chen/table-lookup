@@ -1,7 +1,7 @@
 # 資料對照彙整工具 (table-lookup)
 
 載入兩份資料表,用一份的 key 清單去篩選 / 對照另一份,組出自訂欄位的新表。
-支援 **xlsx / csv / json**。
+支援 **xlsx / xls / csv / json**。
 
 ## 用途
 
@@ -11,7 +11,7 @@
 
 ## 介面(四個分頁)
 
-1. **檔案** — 選兩個來源檔(xlsx 可選工作表,也支援 csv / json)
+1. **檔案** — 選兩個來源檔(xlsx / xls 可選工作表,也支援 csv / json)
 2. **比對與欄位** — 設定 key 欄位與輸出欄位(「來源資料」直接複製欄位、「自訂」用 `{欄名}` 組合)
 3. **預覽 / 執行** — 挑輸出格式與路徑,先預覽再執行
 4. **日誌** — 執行記錄
@@ -25,9 +25,9 @@ table-lookup/
 ├── run.py            # 開發時直接執行
 ├── main_frame.py     # 供 MyTools Launcher 嵌入載入的入口
 ├── build.bat         # PyInstaller 打包
-├── requirements.txt  # 依賴:openpyxl
+├── requirements.txt  # 依賴:openpyxl、xlrd(讀 .xls)
 ├── app/
-│   ├── core.py       # 資料處理核心(讀檔 / 比對 / 輸出,純 stdlib + openpyxl)
+│   ├── core.py       # 資料處理核心(讀檔 / 比對 / 輸出,stdlib + openpyxl + xlrd)
 │   └── main.py       # Tkinter UI
 └── tests/smoke.py
 ```

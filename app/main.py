@@ -113,7 +113,7 @@ class FilePickerRow(ttk.Frame):
         ext = Path(path).suffix.lower() if path else ""
         sheets: list[str] = []
         sheet_err: str | None = None
-        if path and ext in (".xlsx", ".xlsm"):
+        if path and ext in (".xlsx", ".xlsm", ".xls"):
             try:
                 sheets = list_sheets(path)
             except Exception as e:
@@ -427,7 +427,15 @@ class ScrollableRowFrame(ttk.Frame):
             ww = self.canvas.winfo_width()
             wh = self.canvas.winfo_height()
             if wx <= x <= wx + ww and wy <= y <= wy + wh:
-                self.canvas.yview_scroll(int(-event.delta / 120), "units")
+                first, last = self.canvas.yview()
+                # 內容比畫面短(全部已可見)時不滾動,避免頂端被推出空白
+                if last - first >= 1.0:
+                    return
+                step = int(-event.delta / 120)
+                # 已到頂/到底就不要再往該方向滾過頭
+                if (step < 0 and first <= 0.0) or (step > 0 and last >= 1.0):
+                    return
+                self.canvas.yview_scroll(step, "units")
         except tk.TclError:
             pass
 
@@ -815,6 +823,10 @@ class MainWindow:
         self._preview_ready = False
         self._load_gen = {1: 0, 2: 0}
         self._merge_running = False
+
+        # 防止滑鼠滾輪在 Combobox 上停留時誤改選取值;
+        # 下拉清單本身是另一個 widget class,捲動不受影響。
+        root.bind_class("TCombobox", "<MouseWheel>", lambda _e: "break")
 
         self._build_menu()
         self._build_ui()

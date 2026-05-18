@@ -114,7 +114,14 @@ def _safe_str(v: Any) -> str:
 
 def list_sheets(path: str | Path) -> list[str]:
     p = Path(path)
-    if p.suffix.lower() not in (".xlsx", ".xlsm"):
+    ext = p.suffix.lower()
+    if ext == ".xls":
+        book = _open_xls(p)
+        try:
+            return list(book.sheet_names())
+        finally:
+            book.release_resources()
+    if ext not in (".xlsx", ".xlsm"):
         return []
     from openpyxl import load_workbook
     wb = load_workbook(p, read_only=True, data_only=True)
@@ -129,6 +136,8 @@ def read_table(path: str | Path, sheet: str | int | None = None) -> Table:
     ext = p.suffix.lower()
     if ext in (".xlsx", ".xlsm"):
         return _read_xlsx(p, sheet)
+    if ext == ".xls":
+        return _read_xls(p, sheet)
     if ext == ".csv":
         return _read_csv(p)
     if ext == ".json":
@@ -170,6 +179,66 @@ def _read_xlsx(p: Path, sheet: str | int | None) -> Table:
         return Table(columns=columns, rows=rows)
     finally:
         wb.close()
+
+
+def _open_xls(p: Path):
+    """開啟舊版二進位 .xls(需 xlrd 套件)。"""
+    try:
+        import xlrd
+    except ImportError as e:
+        raise ImportError(
+            "讀取 .xls 檔需要 xlrd 套件,請執行:pip install xlrd"
+        ) from e
+    return xlrd.open_workbook(str(p), on_demand=True)
+
+
+def _read_xls(p: Path, sheet: str | int | None) -> Table:
+    import xlrd
+
+    book = _open_xls(p)
+    try:
+        if sheet is None or sheet == "":
+            ws = book.sheet_by_index(0)
+        elif isinstance(sheet, int):
+            ws = book.sheet_by_index(sheet)
+        else:
+            if sheet not in book.sheet_names():
+                raise KeyError(f"工作表不存在:{sheet}")
+            ws = book.sheet_by_name(sheet)
+
+        def _cell(c, ctype):
+            if ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
+                return None
+            if ctype == xlrd.XL_CELL_BOOLEAN:
+                return bool(c)
+            if ctype == xlrd.XL_CELL_DATE:
+                try:
+                    return xlrd.xldate.xldate_as_datetime(c, book.datemode)
+                except Exception:
+                    return c
+            if ctype == xlrd.XL_CELL_NUMBER and float(c).is_integer():
+                return int(c)
+            return c
+
+        if ws.nrows == 0:
+            return Table(columns=[], rows=[])
+        header = [
+            _safe_str(v) if v not in (None, "") else f"欄位{i + 1}"
+            for i, v in enumerate(ws.row_values(0))
+        ]
+        rows: list[list] = []
+        for r in range(1, ws.nrows):
+            row = [_cell(c, t) for c, t in zip(ws.row_values(r), ws.row_types(r))]
+            if all(v is None or (isinstance(v, str) and v == "") for v in row):
+                continue
+            if len(row) < len(header):
+                row = row + [None] * (len(header) - len(row))
+            elif len(row) > len(header):
+                row = row[:len(header)]
+            rows.append(row)
+        return Table(columns=header, rows=rows)
+    finally:
+        book.release_resources()
 
 
 def _read_csv(p: Path) -> Table:

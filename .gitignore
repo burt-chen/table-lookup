@@ -5,6 +5,7 @@ build/
 dist/
 *.spec
 *.xlsx
+*.xls
 *.csv
 *.xml
 build_log.txt
