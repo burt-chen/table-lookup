@@ -26,6 +26,7 @@ from app.core import (
     list_sheets,
     read_table,
     run_merge,
+    template_columns,
 )
 
 
@@ -198,6 +199,9 @@ class MappingRow(tk.Frame):
         self.table = table
         self._pending_value = ""
         self._is_current = False
+        # 只輸出「單邊才有」的資料時,另一邊沒有對應列,來源選擇要被限制住
+        self._allowed = set(table._allowed_sources)
+        self._stashed_ref = ""  # 被限制時暫存的另一邊參照,解除後還原
 
         # Left indicator bar (col 0) — narrow strip that lights up when selected.
         self.indicator = tk.Frame(self, width=5, bg=self.NORMAL_BG)
@@ -294,7 +298,7 @@ class MappingRow(tk.Frame):
         self.col_var = tk.StringVar()
         self.src_cb = ttk.Combobox(
             self.value_holder, textvariable=self.src_var,
-            values=["來源 1", "來源 2"], state="readonly", width=10,
+            values=self._src_values(), state="readonly", width=10,
         )
         self.src_cb.grid(row=0, column=0, padx=(0, 4))
         self.col_cb = ttk.Combobox(
@@ -320,7 +324,9 @@ class MappingRow(tk.Frame):
             return
         menu_font = ("TkDefaultFont", UI_FONT_SIZE)
         menu = tk.Menu(self.insert_btn, tearoff=False, font=menu_font)
-        for src, cols in ((1, self.table._cols1), (2, self.table._cols2)):
+        sources = [(s, c) for s, c in ((1, self.table._cols1), (2, self.table._cols2))
+                   if s in self._allowed]
+        for src, cols in sources:
             sub = tk.Menu(menu, tearoff=False, font=menu_font)
             if cols:
                 for c in cols:
@@ -340,11 +346,43 @@ class MappingRow(tk.Frame):
         self.tpl_entry.icursor(pos + len(token))
         self.tpl_entry.focus_set()
 
+    # ---- source restriction ----
+
+    def _src_values(self) -> list[str]:
+        return [f"來源 {s}" for s in sorted(self._allowed)]
+
+    def set_allowed_sources(self, allowed: set[int]) -> None:
+        """限制這一列能挑哪個來源;被擋掉的參照先存起來,解除限制時還原。"""
+        if self._allowed == allowed:
+            return
+        self._allowed = set(allowed)
+        if self.mode_internal() == "template":
+            self._rebuild_insert_menu()
+            return
+        self.src_cb.configure(values=self._src_values())
+        cur_src = 1 if self.src_var.get() == "來源 1" else 2
+        if cur_src not in self._allowed:
+            self._stashed_ref = self.value()
+            self.src_var.set(self._src_values()[0])
+            self.col_var.set("")
+            self._pending_value = ""
+            self._refill_col_cb()
+        elif self._stashed_ref and not self.col_var.get():
+            ref, self._stashed_ref = self._stashed_ref, ""
+            self._apply_copy_value(ref)
+        else:
+            self._refill_col_cb()
+
     # ---- copy mode helpers ----
 
     def _apply_copy_value(self, v: str):
         self._pending_value = (v or "").strip()
         parsed = _parse_ref(v, self.table._cols1, self.table._cols2)
+        if parsed is not None and parsed[0] not in self._allowed:
+            # 目前不允許的來源:先收進暫存,等限制解除再還原
+            self._stashed_ref = self._pending_value
+            self._pending_value = ""
+            parsed = None
         if parsed is not None:
             src, col = parsed
             self.src_var.set(f"來源 {src}")
@@ -353,8 +391,8 @@ class MappingRow(tk.Frame):
                 self.col_var.set(col)
                 self._pending_value = ""
         else:
-            if not self.src_var.get():
-                self.src_var.set("來源 1")
+            if self.src_var.get() not in self._src_values():
+                self.src_var.set(self._src_values()[0])
             self._refill_col_cb()
 
     def _refill_col_cb(self):
@@ -454,6 +492,7 @@ class MappingTable(ttk.Frame):
         self._cols1: list[str] = []
         self._cols2: list[str] = []
         self._rows: list[MappingRow] = []
+        self._allowed_sources: set[int] = {1, 2}
         self._current: MappingRow | None = None
         self._on_changed_cb = on_changed
         self._emit_changes = True
@@ -509,6 +548,20 @@ class MappingTable(ttk.Frame):
         self._cols2 = list(cols2)
         for row in self._rows:
             row.refresh_source_columns()
+
+    def set_allowed_sources(self, allowed: set[int]) -> None:
+        """只輸出單邊才有的資料時,把輸出欄位鎖在那一邊的來源。"""
+        allowed = set(allowed) or {1, 2}
+        if allowed == self._allowed_sources:
+            return
+        self._allowed_sources = allowed
+        self._emit_changes = False
+        try:
+            for row in self._rows:
+                row.set_allowed_sources(allowed)
+        finally:
+            self._emit_changes = True
+        self._on_changed()
 
     def get_columns(self) -> list[OutputColumn]:
         out = []
@@ -613,6 +666,13 @@ class MappingTable(ttk.Frame):
         cols = self._cols1 if src == 1 else self._cols2
         if not cols:
             messagebox.showinfo("提示", f"來源 {src} 尚未載入")
+            return
+        if src not in self._allowed_sources:
+            messagebox.showinfo(
+                "提示",
+                f"目前的輸出範圍設定下,這些列在來源 {src} 沒有對應資料,"
+                f"只能挑來源 {sorted(self._allowed_sources)[0]} 的欄位。",
+            )
             return
         existing = {r.name() for r in self._rows}
         for c in cols:
@@ -878,8 +938,9 @@ class MainWindow:
         intro_text = (
             "角色說明\n"
             "  • 來源 1:要彙整的資料(欄位較多的母檔,輸出欄位的內容都來自這裡)\n"
-            "  • 來源 2:篩選條件(只挑出 key 在此清單中的列)\n"
-            "處理邏輯:用「來源 2」某欄的值,去「來源 1」找對應列,組出新表。"
+            "  • 來源 2:篩選條件(提供 key 清單)\n"
+            "處理邏輯:用「來源 2」某欄的值,去「來源 1」找對應列,組出新表。\n"
+            "若想反過來抓「來源 2 沒對應到的資料」,到「比對與欄位」分頁勾「篩選沒有對應資料」。"
         )
         tk.Label(
             page, text=intro_text, justify="left", anchor="w",
@@ -910,7 +971,7 @@ class MainWindow:
     def _build_mapping_tab(self, parent):
         page = ttk.Frame(parent)
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(1, weight=1)
+        page.rowconfigure(2, weight=1)
 
         match_box = ttk.LabelFrame(page, text="比對設定")
         match_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -926,15 +987,29 @@ class MainWindow:
         for var in (self.match_col1_var, self.filter_col2_var):
             var.trace_add("write", lambda *_: self._invalidate_preview())
 
+        scope_box = ttk.LabelFrame(page, text="比對選項")
+        scope_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.only_missing_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            scope_box,
+            text="篩選沒有對應資料(改抓「來源 1 有、來源 2 沒有」的列)",
+            variable=self.only_missing_var, command=self._on_scope_changed,
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        self.scope_hint_var = tk.StringVar(value="")
+        ttk.Label(scope_box, textvariable=self.scope_hint_var, foreground="#b26a00").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(2, 6)
+        )
+
         mapping_box = ttk.LabelFrame(
             page,
             text="輸出欄位 (「來源資料」直接複製欄位、「自訂」用 {欄名} 組合;前綴 1./2. 指定來源)",
         )
-        mapping_box.grid(row=1, column=0, sticky="nsew")
+        mapping_box.grid(row=2, column=0, sticky="nsew")
         mapping_box.columnconfigure(0, weight=1)
         mapping_box.rowconfigure(0, weight=1)
         self.mapping = MappingTable(mapping_box, on_changed=self._invalidate_preview)
         self.mapping.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self._on_scope_changed()
         return page
 
     def _build_preview_tab(self, parent):
@@ -1136,6 +1211,19 @@ class MainWindow:
 
     # ---- preview gating ----
 
+    # ---- 輸出範圍(勾選)----
+
+    def _on_scope_changed(self, *_a):
+        """篩選沒有對應資料時,這些列在來源 2 沒有對應,輸出欄位鎖成只能挑來源 1。"""
+        if self.only_missing_var.get():
+            allowed = {1}
+            hint = "只抓來源 2 沒有對應的資料 → 輸出欄位只能挑來源 1。"
+        else:
+            allowed, hint = {1, 2}, ""
+        self.scope_hint_var.set(hint)
+        self.mapping.set_allowed_sources(allowed)
+        self._invalidate_preview()
+
     def _invalidate_preview(self, *_a):
         self._preview_ready = False
         if hasattr(self, "run_btn"):
@@ -1159,7 +1247,11 @@ class MainWindow:
             file2=self.picker2.path(), sheet2=self.picker2.sheet(),
             match_col1=self.match_col1_var.get(),
             filter_col2=self.filter_col2_var.get(),
-            drop_duplicates=True, keep_unmatched=False,
+            drop_duplicates=True,
+            include_matched=not self.only_missing_var.get(),
+            include_only_in_2=False,
+            include_only_in_1=self.only_missing_var.get(),
+            ignore_case=False,
             outputs=self.mapping.get_columns(),
         )
         if not cfg.match_col1:
@@ -1171,7 +1263,29 @@ class MainWindow:
         if not cfg.outputs:
             messagebox.showwarning("缺少設定", "請至少新增一個輸出欄位")
             return None
+        self._warn_blocked_refs(cfg)
         return cfg
+
+    def _warn_blocked_refs(self, cfg: MergeConfig) -> None:
+        """輸出範圍鎖單邊時,自訂模板若還指到另一邊,結果會是空白 — 寫進日誌提醒。"""
+        allowed = self.mapping._allowed_sources
+        if allowed == {1, 2}:
+            return
+        blocked = 2 if allowed == {1} else 1
+        # 比對欄位本身仍拿得到值(就是 key),不算問題
+        key_col = cfg.filter_col2 if blocked == 2 else cfg.match_col1
+        bad: list[str] = []
+        for col in cfg.outputs:
+            refs = template_columns(col.value) if col.mode == "template" else [col.value]
+            for ref in refs:
+                ref = (ref or "").strip()
+                if ref.startswith(f"{blocked}.") and ref[2:] != key_col:
+                    bad.append(f"{col.name} → {{{ref}}}")
+        if bad:
+            self._log(
+                f"提醒:目前只輸出單邊資料,以下欄位仍指向來源 {blocked},會是空白 — "
+                + "、".join(bad)
+            )
 
     def _do_preview(self):
         if self._merge_running:
@@ -1214,12 +1328,18 @@ class MainWindow:
         self.preview_btn.configure(state="normal")
         self._log(
             f"完成:輸出 {len(result.df)} 列,來源 2 共 {result.total_keys} 個 key,"
-            f"未匹配 {len(result.missing_keys)} 個"
+            f"兩邊都有 {result.matched_count} 列,來源 1 找不到 {len(result.missing_keys)} 個,"
+            f"來源 2 沒列到 {len(result.only_in_1_keys)} 個"
         )
-        if result.missing_keys:
-            head = ", ".join(result.missing_keys[:10])
-            more = f" …(其餘 {len(result.missing_keys) - 10})" if len(result.missing_keys) > 10 else ""
-            self._log(f"未匹配範例:{head}{more}")
+        for label, keys in (
+            ("來源 1 找不到", result.missing_keys),
+            ("來源 2 沒列到", result.only_in_1_keys),
+        ):
+            if not keys:
+                continue
+            head = ", ".join(keys[:10])
+            more = f" …(其餘 {len(keys) - 10})" if len(keys) > 10 else ""
+            self._log(f"{label}範例:{head}{more}")
         self._result_df = result.df
         self.preview_out.show_df(result.df)
         self.inner_preview.select(2)
@@ -1263,7 +1383,11 @@ class MainWindow:
             file2=self.picker2.path(), sheet2=self.picker2.sheet(),
             match_col1=self.match_col1_var.get(),
             filter_col2=self.filter_col2_var.get(),
-            drop_duplicates=True, keep_unmatched=False,
+            drop_duplicates=True,
+            include_matched=not self.only_missing_var.get(),
+            include_only_in_2=False,
+            include_only_in_1=self.only_missing_var.get(),
+            ignore_case=False,
             outputs=self.mapping.get_columns(),
         )
         data = cfg.to_dict()
@@ -1307,6 +1431,9 @@ class MainWindow:
             self.match_col1_var.set(cfg.match_col1)
         if cfg.filter_col2:
             self.filter_col2_var.set(cfg.filter_col2)
+        # 勾選狀態要先套用,新建的欄位列才會拿到正確的來源限制
+        self.only_missing_var.set(cfg.include_only_in_1)
+        self._on_scope_changed()
         self.mapping.set_columns(cfg.outputs)
         if data.get("output_path"):
             self.out_path_var.set(data["output_path"])

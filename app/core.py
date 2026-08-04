@@ -376,7 +376,11 @@ class MergeConfig:
     match_col1: str = ""
     filter_col2: str = ""
     drop_duplicates: bool = True
-    keep_unmatched: bool = False
+    # 要輸出哪幾種資料(可複選)
+    include_matched: bool = True       # 兩邊都有(交集)
+    include_only_in_2: bool = False    # 只有來源 2 有、來源 1 找不到
+    include_only_in_1: bool = False    # 只有來源 1 有、來源 2 沒列到
+    ignore_case: bool = False          # 比對時忽略英文大小寫
     outputs: list[OutputColumn] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -388,7 +392,10 @@ class MergeConfig:
             "match_col1": self.match_col1,
             "filter_col2": self.filter_col2,
             "drop_duplicates": self.drop_duplicates,
-            "keep_unmatched": self.keep_unmatched,
+            "include_matched": self.include_matched,
+            "include_only_in_2": self.include_only_in_2,
+            "include_only_in_1": self.include_only_in_1,
+            "ignore_case": self.ignore_case,
             "outputs": [o.to_dict() for o in self.outputs],
         }
 
@@ -402,7 +409,11 @@ class MergeConfig:
         c.match_col1 = d.get("match_col1", "")
         c.filter_col2 = d.get("filter_col2", "")
         c.drop_duplicates = d.get("drop_duplicates", True)
-        c.keep_unmatched = d.get("keep_unmatched", False)
+        c.include_matched = d.get("include_matched", True)
+        # 舊設定檔只有 keep_unmatched(= 未匹配也留一列),對應到「只有來源 2」
+        c.include_only_in_2 = d.get("include_only_in_2", d.get("keep_unmatched", False))
+        c.include_only_in_1 = d.get("include_only_in_1", False)
+        c.ignore_case = d.get("ignore_case", False)
         c.outputs = [OutputColumn.from_dict(o) for o in d.get("outputs", [])]
         return c
 
@@ -410,8 +421,10 @@ class MergeConfig:
 @dataclass
 class MergeResult:
     table: Table
-    missing_keys: list[str]
-    total_keys: int
+    missing_keys: list[str]          # 來源 2 有、來源 1 找不到的 key
+    total_keys: int                  # 來源 2 的有效 key 數
+    matched_count: int = 0           # 兩邊都有而輸出的列數
+    only_in_1_keys: list[str] = field(default_factory=list)  # 來源 1 有、來源 2 沒列到
 
     # Backwards-compat alias so callers expecting .df still work.
     @property
@@ -425,6 +438,12 @@ def _normalize_key(v: Any) -> str:
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
     return str(v).strip()
+
+
+def _key_pair(v: Any, ignore_case: bool) -> tuple[str, str]:
+    """(顯示用 key, 比對用 key) — 忽略大小寫時比對用的會轉小寫。"""
+    disp = _normalize_key(v)
+    return disp, (disp.casefold() if ignore_case else disp)
 
 
 # ============================================================================
@@ -455,52 +474,40 @@ def run_merge(
     if cfg.filter_col2 not in t2.columns:
         raise KeyError(f"來源 2 找不到欄位:{cfg.filter_col2}")
 
+    if not (cfg.include_matched or cfg.include_only_in_2 or cfg.include_only_in_1):
+        raise ValueError("請至少勾選一種要輸出的資料(兩邊都有 / 只有來源 2 / 只有來源 1)")
+
     _p(35, 100, "建立索引…")
     match_idx = t1.column_index(cfg.match_col1)
     filter_idx = t2.column_index(cfg.filter_col2)
+    ic = cfg.ignore_case
 
     # Index of source 1: first occurrence wins when drop_duplicates is on
     lookup: dict[str, list] = {}
     for row in t1.rows:
-        key = _normalize_key(row[match_idx] if match_idx < len(row) else None)
+        _, key = _key_pair(row[match_idx] if match_idx < len(row) else None, ic)
         if not key:
             continue
         if key in lookup and cfg.drop_duplicates:
             continue
         lookup[key] = row
 
-    keys: list[str] = []
+    keys2: set[str] = set()
+    total = 0
     for row in t2.rows:
-        k = _normalize_key(row[filter_idx] if filter_idx < len(row) else None)
+        _, k = _key_pair(row[filter_idx] if filter_idx < len(row) else None, ic)
         if k:
-            keys.append(k)
-    total = len(keys)
+            keys2.add(k)
+            total += 1
     _p(45, 100, f"開始比對 {total} 筆…")
 
     out_columns = [c.name for c in cfg.outputs]
     out_rows: list[list] = []
     missing: list[str] = []
-    idx = 0
-    progress_every = max(1, total // 50) if total else 1
+    only_in_1: list[str] = []
+    matched_count = 0
 
-    for r2 in t2.rows:
-        key = _normalize_key(r2[filter_idx] if filter_idx < len(r2) else None)
-        if not key:
-            continue
-        src2_dict = {c: (r2[j] if j < len(r2) else None) for j, c in enumerate(t2.columns)}
-
-        if key in lookup:
-            r1 = lookup[key]
-            src1_dict = {c: (r1[j] if j < len(r1) else None) for j, c in enumerate(t1.columns)}
-        else:
-            missing.append(key)
-            if not cfg.keep_unmatched:
-                idx += 1
-                if progress and total and idx % progress_every == 0:
-                    _p(45 + int(45 * idx / total), 100, f"比對中 {idx}/{total}")
-                continue
-            src1_dict = {cfg.match_col1: key}
-
+    def _build_row(src1_dict: dict, src2_dict: dict) -> list:
         row_out: list = []
         for col in cfg.outputs:
             if col.mode == "copy":
@@ -508,16 +515,60 @@ def run_merge(
                 row_out.append("" if v is None or _is_nan(v) else v)
             else:
                 row_out.append(render_template(col.value, src1_dict, src2_dict))
-        out_rows.append(row_out)
+        return row_out
 
+    # ---- pass 1: 以來源 2 為主軸(交集 + 只有來源 2) ----
+    idx = 0
+    progress_every = max(1, total // 50) if total else 1
+    for r2 in t2.rows:
+        disp, key = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        if not key:
+            continue
         idx += 1
         if progress and total and idx % progress_every == 0:
-            _p(45 + int(45 * idx / total), 100, f"比對中 {idx}/{total}")
+            _p(45 + int(40 * idx / total), 100, f"比對中 {idx}/{total}")
+
+        r1 = lookup.get(key)
+        if r1 is None:
+            missing.append(disp)
+            if not cfg.include_only_in_2:
+                continue
+            src1_dict = {cfg.match_col1: disp}
+        else:
+            if not cfg.include_matched:
+                continue
+            matched_count += 1
+            src1_dict = {c: (r1[j] if j < len(r1) else None) for j, c in enumerate(t1.columns)}
+
+        src2_dict = {c: (r2[j] if j < len(r2) else None) for j, c in enumerate(t2.columns)}
+        out_rows.append(_build_row(src1_dict, src2_dict))
+
+    # ---- pass 2: 只有來源 1 有、來源 2 沒列到的 ----
+    if cfg.include_only_in_1:
+        _p(88, 100, "找出來源 2 沒列到的資料…")
+        seen1: set[str] = set()
+        for r1 in t1.rows:
+            disp, key = _key_pair(r1[match_idx] if match_idx < len(r1) else None, ic)
+            if not key or key in keys2:
+                continue
+            if key in seen1 and cfg.drop_duplicates:
+                continue
+            seen1.add(key)
+            only_in_1.append(disp)
+            src1_dict = {c: (r1[j] if j < len(r1) else None) for j, c in enumerate(t1.columns)}
+            src2_dict = {cfg.filter_col2: disp}
+            out_rows.append(_build_row(src1_dict, src2_dict))
 
     _p(95, 100, "建立輸出表…")
     out_table = Table(columns=out_columns, rows=out_rows)
     _p(100, 100, "完成")
-    return MergeResult(table=out_table, missing_keys=missing, total_keys=total)
+    return MergeResult(
+        table=out_table,
+        missing_keys=missing,
+        total_keys=total,
+        matched_count=matched_count,
+        only_in_1_keys=only_in_1,
+    )
 
 
 # ============================================================================
