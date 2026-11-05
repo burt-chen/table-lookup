@@ -381,6 +381,8 @@ class MergeConfig:
     include_only_in_2: bool = False    # 只有來源 2 有、來源 1 找不到
     include_only_in_1: bool = False    # 只有來源 1 有、來源 2 沒列到
     ignore_case: bool = False          # 比對時忽略英文大小寫
+    # 來源 1 全部資料:來源 1 欄位每列都顯示,來源 2 / 自訂欄位只填在被篩選到的列
+    keep_all_src1: bool = False
     outputs: list[OutputColumn] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -396,6 +398,7 @@ class MergeConfig:
             "include_only_in_2": self.include_only_in_2,
             "include_only_in_1": self.include_only_in_1,
             "ignore_case": self.ignore_case,
+            "keep_all_src1": self.keep_all_src1,
             "outputs": [o.to_dict() for o in self.outputs],
         }
 
@@ -414,6 +417,7 @@ class MergeConfig:
         c.include_only_in_2 = d.get("include_only_in_2", d.get("keep_unmatched", False))
         c.include_only_in_1 = d.get("include_only_in_1", False)
         c.ignore_case = d.get("ignore_case", False)
+        c.keep_all_src1 = d.get("keep_all_src1", False)
         c.outputs = [OutputColumn.from_dict(o) for o in d.get("outputs", [])]
         return c
 
@@ -517,6 +521,9 @@ def run_merge(
                 row_out.append(render_template(col.value, src1_dict, src2_dict))
         return row_out
 
+    if cfg.keep_all_src1:
+        return _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row)
+
     # ---- pass 1: 以來源 2 為主軸(交集 + 只有來源 2) ----
     idx = 0
     progress_every = max(1, total // 50) if total else 1
@@ -561,6 +568,86 @@ def run_merge(
 
     _p(95, 100, "建立輸出表…")
     out_table = Table(columns=out_columns, rows=out_rows)
+    _p(100, 100, "完成")
+    return MergeResult(
+        table=out_table,
+        missing_keys=missing,
+        total_keys=total,
+        matched_count=matched_count,
+        only_in_1_keys=only_in_1,
+    )
+
+
+def _is_src1_copy(col: OutputColumn, src1_columns: set[str]) -> bool:
+    """「來源資料」模式且指向來源 1 的欄位 → 來源 1 全部資料模式下每列都顯示。"""
+    if col.mode != "copy":
+        return False
+    ref = (col.value or "").strip()
+    if ref.startswith("1."):
+        return True
+    if ref.startswith("2."):
+        return False
+    return ref in src1_columns
+
+
+def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row) -> MergeResult:
+    """來源 1 每列都輸出(照原順序);被篩選到的列才填來源 2 / 自訂欄位。
+
+    被篩選到 = 有對應到來源 2(預設),勾「篩選沒有對應資料」時 = 沒對應到。
+    """
+    ic = cfg.ignore_case
+    only_missing = cfg.include_only_in_1 and not cfg.include_matched
+
+    # 來源 2 key → 第一筆列
+    lookup2: dict[str, list] = {}
+    for r2 in t2.rows:
+        _, k = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        if k and k not in lookup2:
+            lookup2[k] = r2
+
+    src1_cols = set(t1.columns)
+    always = [_is_src1_copy(c, src1_cols) for c in cfg.outputs]
+
+    keys1: set[str] = set()
+    out_rows: list[list] = []
+    only_in_1: list[str] = []
+    seen_only1: set[str] = set()
+    matched_count = 0
+    n = len(t1.rows)
+    step = max(1, n // 50) if n else 1
+    for i, r1 in enumerate(t1.rows, 1):
+        if i % step == 0:
+            _p(45 + int(40 * i / n), 100, f"處理中 {i}/{n}")
+        disp, key = _key_pair(r1[match_idx] if match_idx < len(r1) else None, ic)
+        if key:
+            keys1.add(key)
+        r2 = lookup2.get(key) if key else None
+        if r2 is not None:
+            matched_count += 1
+        elif key and key not in seen_only1:
+            seen_only1.add(key)
+            only_in_1.append(disp)
+
+        selected = (r2 is None) if only_missing else (r2 is not None)
+        src1_dict = {c: (r1[j] if j < len(r1) else None) for j, c in enumerate(t1.columns)}
+        if r2 is not None:
+            src2_dict = {c: (r2[j] if j < len(r2) else None) for j, c in enumerate(t2.columns)}
+        else:
+            src2_dict = {cfg.filter_col2: disp}
+        full = _build_row(src1_dict, src2_dict)
+        out_rows.append([v if (selected or always[j]) else "" for j, v in enumerate(full)])
+
+    # 來源 2 有、來源 1 找不到的 key(只記在日誌,不輸出)
+    missing: list[str] = []
+    seen_m: set[str] = set()
+    for r2 in t2.rows:
+        disp, k = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        if k and k not in keys1 and k not in seen_m:
+            seen_m.add(k)
+            missing.append(disp)
+
+    _p(95, 100, "建立輸出表…")
+    out_table = Table(columns=[c.name for c in cfg.outputs], rows=out_rows)
     _p(100, 100, "完成")
     return MergeResult(
         table=out_table,

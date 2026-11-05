@@ -41,6 +41,8 @@ def _is_empty(v) -> bool:
 
 APP_TITLE = "資料對照彙整工具"
 SETTINGS_PATH = Path.home() / ".table_lookup_settings.json"
+RANGE_FILTERED = "篩選資料"
+RANGE_ALL_SRC1 = "來源 1 全部資料"
 # Source previews now load every row via batched insertion (see PreviewTable)
 
 
@@ -940,7 +942,8 @@ class MainWindow:
             "  • 來源 1:要彙整的資料(欄位較多的母檔,輸出欄位的內容都來自這裡)\n"
             "  • 來源 2:篩選條件(提供 key 清單)\n"
             "處理邏輯:用「來源 2」某欄的值,去「來源 1」找對應列,組出新表。\n"
-            "若想反過來抓「來源 2 沒對應到的資料」,到「比對與欄位」分頁勾「篩選沒有對應資料」。"
+            "若想反過來抓「來源 2 沒對應到的資料」,到「比對與欄位」分頁勾「篩選沒有對應資料」。\n"
+            "「輸出範圍」選「來源 1 全部資料」時,來源 1 每列都輸出,篩選到的列才帶出來源 2 / 自訂欄位。"
         )
         tk.Label(
             page, text=intro_text, justify="left", anchor="w",
@@ -989,6 +992,21 @@ class MainWindow:
 
         scope_box = ttk.LabelFrame(page, text="比對選項")
         scope_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        range_row = ttk.Frame(scope_box)
+        range_row.grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
+        ttk.Label(range_row, text="輸出範圍:").pack(side="left")
+        self.range_var = tk.StringVar(value=RANGE_FILTERED)
+        range_cb = ttk.Combobox(
+            range_row, textvariable=self.range_var, state="readonly", width=16,
+            values=[RANGE_FILTERED, RANGE_ALL_SRC1],
+        )
+        range_cb.pack(side="left", padx=(4, 8))
+        range_cb.bind("<<ComboboxSelected>>", self._invalidate_preview)
+        ttk.Label(
+            range_row,
+            text="來源 1 全部資料:來源 1 每列都輸出,來源 2 / 自訂欄位只顯示在篩選到的列",
+            foreground="#555555",
+        ).pack(side="left")
         self.only_missing_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             scope_box,
@@ -1252,6 +1270,7 @@ class MainWindow:
             include_only_in_2=False,
             include_only_in_1=self.only_missing_var.get(),
             ignore_case=False,
+            keep_all_src1=self.range_var.get() == RANGE_ALL_SRC1,
             outputs=self.mapping.get_columns(),
         )
         if not cfg.match_col1:
@@ -1388,6 +1407,7 @@ class MainWindow:
             include_only_in_2=False,
             include_only_in_1=self.only_missing_var.get(),
             ignore_case=False,
+            keep_all_src1=self.range_var.get() == RANGE_ALL_SRC1,
             outputs=self.mapping.get_columns(),
         )
         data = cfg.to_dict()
@@ -1433,6 +1453,7 @@ class MainWindow:
             self.filter_col2_var.set(cfg.filter_col2)
         # 勾選狀態要先套用,新建的欄位列才會拿到正確的來源限制
         self.only_missing_var.set(cfg.include_only_in_1)
+        self.range_var.set(RANGE_ALL_SRC1 if cfg.keep_all_src1 else RANGE_FILTERED)
         self._on_scope_changed()
         self.mapping.set_columns(cfg.outputs)
         if data.get("output_path"):
