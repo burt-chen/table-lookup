@@ -1001,12 +1001,9 @@ class MainWindow:
             values=[RANGE_FILTERED, RANGE_ALL_SRC1],
         )
         range_cb.pack(side="left", padx=(4, 8))
-        range_cb.bind("<<ComboboxSelected>>", self._invalidate_preview)
-        ttk.Label(
-            range_row,
-            text="來源 1 全部資料:來源 1 每列都輸出,來源 2 / 自訂欄位只顯示在篩選到的列",
-            foreground="#555555",
-        ).pack(side="left")
+        range_cb.bind("<<ComboboxSelected>>", self._on_scope_changed)
+        self.range_hint_var = tk.StringVar(value="")
+        ttk.Label(range_row, textvariable=self.range_hint_var, foreground="#b26a00").pack(side="left")
         self.only_missing_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             scope_box,
@@ -1239,8 +1236,20 @@ class MainWindow:
         else:
             allowed, hint = {1, 2}, ""
         self.scope_hint_var.set(hint)
+        self._update_range_hint()
         self.mapping.set_allowed_sources(allowed)
         self._invalidate_preview()
+
+    def _update_range_hint(self):
+        """輸出範圍後方的說明,依目前選擇顯示實際會匯出的規則。"""
+        missing = self.only_missing_var.get()
+        if self.range_var.get() == RANGE_ALL_SRC1:
+            hint = ("來源 1 每列都匯出;沒對應的列才顯示自訂欄位" if missing
+                    else "來源 1 每列都匯出;有對應的列才顯示來源 2 / 自訂欄位")
+        else:
+            hint = ("只匯出來源 1 有、來源 2 沒有對應的列" if missing
+                    else "只匯出來源 1、來源 2 都有對應的列")
+        self.range_hint_var.set(hint)
 
     def _invalidate_preview(self, *_a):
         self._preview_ready = False
