@@ -67,8 +67,7 @@ def setup_scene(root, frame, app, scene_id: str, scene_name: str) -> None:
         app._load_gen[2] += 1
         app._on_load_finished(1, app._load_gen[1], mod.read_table(str(src1), "來源1"))
         app._on_load_finished(2, app._load_gen[2], mod.read_table(str(src2), "來源2"))
-        app.match_col1_var.set("客戶代號")
-        app.filter_col2_var.set("客戶代號")
+        app.key_pairs.set_pairs([["客戶代號", "客戶代號"]])
         app.only_missing_var.set(False)
         app._on_scope_changed()
         app.mapping.set_columns([

@@ -145,6 +145,26 @@ def read_table(path: str | Path, sheet: str | int | None = None) -> Table:
     raise ValueError(f"不支援的檔案格式:{ext}")
 
 
+_ZERO_PAD_FMT = re.compile(r"0+")
+
+
+def _apply_zero_pad(v: Any, fmt: str | None) -> Any:
+    """數字套了「0000」這類純補 0 的格式時,照 Excel 顯示轉成文字(103 → "0103")。
+
+    其他格式(千分位、小數、日期…)與非整數、負數維持原值。
+    """
+    if not fmt or isinstance(v, bool) or not isinstance(v, (int, float)):
+        return v
+    fmt = fmt.strip()
+    if not _ZERO_PAD_FMT.fullmatch(fmt):
+        return v
+    if isinstance(v, float) and not v.is_integer():
+        return v
+    if v < 0:
+        return v
+    return str(int(v)).zfill(len(fmt))
+
+
 def _read_xlsx(p: Path, sheet: str | int | None) -> Table:
     from openpyxl import load_workbook
     wb = load_workbook(p, read_only=True, data_only=True)
@@ -158,15 +178,19 @@ def _read_xlsx(p: Path, sheet: str | int | None) -> Table:
                 raise KeyError(f"工作表不存在:{sheet}")
             ws = wb[sheet]
 
-        rows_iter = ws.iter_rows(values_only=True)
-        header_tuple = next(rows_iter, None)
-        if header_tuple is None:
+        rows_iter = ws.iter_rows()
+        header_cells = next(rows_iter, None)
+        if header_cells is None:
             return Table(columns=[], rows=[])
+        header_tuple = [getattr(c, "value", None) for c in header_cells]
         columns = [_safe_str(c) if c is not None else f"欄位{i + 1}"
                    for i, c in enumerate(header_tuple)]
         rows: list[list] = []
-        for r in rows_iter:
-            row = list(r)
+        for cells in rows_iter:
+            row = [
+                _apply_zero_pad(getattr(c, "value", None), getattr(c, "number_format", None))
+                for c in cells
+            ]
             # Skip wholly empty rows (openpyxl returns trailing blanks sometimes)
             if all(v is None or (isinstance(v, str) and v == "") for v in row):
                 continue
@@ -189,7 +213,11 @@ def _open_xls(p: Path):
         raise ImportError(
             "讀取 .xls 檔需要 xlrd 套件,請執行:pip install xlrd"
         ) from e
-    return xlrd.open_workbook(str(p), on_demand=True)
+    # formatting_info 才讀得到數字格式(補 0 用);少數檔案不支援時退回不讀格式
+    try:
+        return xlrd.open_workbook(str(p), on_demand=True, formatting_info=True)
+    except NotImplementedError:
+        return xlrd.open_workbook(str(p), on_demand=True)
 
 
 def _read_xls(p: Path, sheet: str | int | None) -> Table:
@@ -226,9 +254,23 @@ def _read_xls(p: Path, sheet: str | int | None) -> Table:
             _safe_str(v) if v not in (None, "") else f"欄位{i + 1}"
             for i, v in enumerate(ws.row_values(0))
         ]
+        has_fmt = bool(getattr(book, "xf_list", None))
+
+        def _fmt(r: int, c: int) -> str | None:
+            if not has_fmt:
+                return None
+            try:
+                xf = book.xf_list[ws.cell_xf_index(r, c)]
+                return book.format_map[xf.format_key].format_str
+            except Exception:
+                return None
+
         rows: list[list] = []
         for r in range(1, ws.nrows):
-            row = [_cell(c, t) for c, t in zip(ws.row_values(r), ws.row_types(r))]
+            row = [
+                _apply_zero_pad(_cell(c, t), _fmt(r, ci) if t == xlrd.XL_CELL_NUMBER else None)
+                for ci, (c, t) in enumerate(zip(ws.row_values(r), ws.row_types(r)))
+            ]
             if all(v is None or (isinstance(v, str) and v == "") for v in row):
                 continue
             if len(row) < len(header):
@@ -373,8 +415,10 @@ class MergeConfig:
     sheet1: str = ""
     file2: str = ""
     sheet2: str = ""
-    match_col1: str = ""
+    match_col1: str = ""               # 舊版單欄設定(= 第一組比對欄位)
     filter_col2: str = ""
+    # 多組比對欄位 [[來源 1 欄, 來源 2 欄], ...] — 所有組都相同才算對應
+    key_pairs: list[list[str]] = field(default_factory=list)
     drop_duplicates: bool = True
     # 要輸出哪幾種資料(可複選)
     include_matched: bool = True       # 兩邊都有(交集)
@@ -385,14 +429,26 @@ class MergeConfig:
     keep_all_src1: bool = False
     outputs: list[OutputColumn] = field(default_factory=list)
 
+    def pairs(self) -> list[tuple[str, str]]:
+        """實際使用的比對欄位組;沒設 key_pairs 時退回舊版單欄設定。"""
+        if self.key_pairs:
+            return [(p[0], p[1]) for p in self.key_pairs]
+        if self.match_col1 or self.filter_col2:
+            return [(self.match_col1, self.filter_col2)]
+        return []
+
     def to_dict(self) -> dict:
+        pairs = self.pairs()
+        first = pairs[0] if pairs else ("", "")
         return {
             "file1": self.file1,
             "sheet1": self.sheet1,
             "file2": self.file2,
             "sheet2": self.sheet2,
-            "match_col1": self.match_col1,
-            "filter_col2": self.filter_col2,
+            # match_col1 / filter_col2 留著第一組,舊版程式讀得到
+            "match_col1": first[0],
+            "filter_col2": first[1],
+            "key_pairs": [list(p) for p in pairs],
             "drop_duplicates": self.drop_duplicates,
             "include_matched": self.include_matched,
             "include_only_in_2": self.include_only_in_2,
@@ -411,6 +467,10 @@ class MergeConfig:
         c.sheet2 = d.get("sheet2", "")
         c.match_col1 = d.get("match_col1", "")
         c.filter_col2 = d.get("filter_col2", "")
+        c.key_pairs = [
+            [str(p[0]), str(p[1])] for p in d.get("key_pairs") or []
+            if isinstance(p, (list, tuple)) and len(p) >= 2
+        ]
         c.drop_duplicates = d.get("drop_duplicates", True)
         c.include_matched = d.get("include_matched", True)
         # 舊設定檔只有 keep_unmatched(= 未匹配也留一列),對應到「只有來源 2」
@@ -444,10 +504,20 @@ def _normalize_key(v: Any) -> str:
     return str(v).strip()
 
 
-def _key_pair(v: Any, ignore_case: bool) -> tuple[str, str]:
-    """(顯示用 key, 比對用 key) — 忽略大小寫時比對用的會轉小寫。"""
-    disp = _normalize_key(v)
-    return disp, (disp.casefold() if ignore_case else disp)
+_KEY_SEP = "\x1f"  # 多欄 key 內部串接用,不會出現在一般資料裡
+
+
+def _row_key(row: list, idxs: list[int], ignore_case: bool) -> tuple[str, str, list[str]]:
+    """多欄 key → (顯示用 key, 比對用 key, 各欄值)。
+
+    任一欄空白視為沒有 key(回傳空字串)。顯示用以「 / 」串接,
+    忽略大小寫時比對用的會轉小寫。
+    """
+    parts = [_normalize_key(row[i] if i < len(row) else None) for i in idxs]
+    if not parts or any(p == "" for p in parts):
+        return "", "", parts
+    joined = _KEY_SEP.join(parts)
+    return " / ".join(parts), (joined.casefold() if ignore_case else joined), parts
 
 
 # ============================================================================
@@ -473,23 +543,30 @@ def run_merge(
     if t2 is None:
         t2 = read_table(cfg.file2, cfg.sheet2 or None)
 
-    if cfg.match_col1 not in t1.columns:
-        raise KeyError(f"來源 1 找不到欄位:{cfg.match_col1}")
-    if cfg.filter_col2 not in t2.columns:
-        raise KeyError(f"來源 2 找不到欄位:{cfg.filter_col2}")
+    pairs = cfg.pairs()
+    if not pairs:
+        raise ValueError("請至少設定一組比對欄位")
+    cols1 = [p[0] for p in pairs]
+    cols2 = [p[1] for p in pairs]
+    for c in cols1:
+        if c not in t1.columns:
+            raise KeyError(f"來源 1 找不到欄位:{c}")
+    for c in cols2:
+        if c not in t2.columns:
+            raise KeyError(f"來源 2 找不到欄位:{c}")
 
     if not (cfg.include_matched or cfg.include_only_in_2 or cfg.include_only_in_1):
         raise ValueError("請至少勾選一種要輸出的資料(兩邊都有 / 只有來源 2 / 只有來源 1)")
 
     _p(35, 100, "建立索引…")
-    match_idx = t1.column_index(cfg.match_col1)
-    filter_idx = t2.column_index(cfg.filter_col2)
+    idx1 = [t1.column_index(c) for c in cols1]
+    idx2 = [t2.column_index(c) for c in cols2]
     ic = cfg.ignore_case
 
     # Index of source 1: first occurrence wins when drop_duplicates is on
     lookup: dict[str, list] = {}
     for row in t1.rows:
-        _, key = _key_pair(row[match_idx] if match_idx < len(row) else None, ic)
+        _, key, _ = _row_key(row, idx1, ic)
         if not key:
             continue
         if key in lookup and cfg.drop_duplicates:
@@ -499,7 +576,7 @@ def run_merge(
     keys2: set[str] = set()
     total = 0
     for row in t2.rows:
-        _, k = _key_pair(row[filter_idx] if filter_idx < len(row) else None, ic)
+        _, k, _ = _row_key(row, idx2, ic)
         if k:
             keys2.add(k)
             total += 1
@@ -522,13 +599,13 @@ def run_merge(
         return row_out
 
     if cfg.keep_all_src1:
-        return _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row)
+        return _run_keep_all_src1(cfg, t1, t2, idx1, idx2, cols2, total, _p, _build_row)
 
     # ---- pass 1: 以來源 2 為主軸(交集 + 只有來源 2) ----
     idx = 0
     progress_every = max(1, total // 50) if total else 1
     for r2 in t2.rows:
-        disp, key = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        disp, key, parts = _row_key(r2, idx2, ic)
         if not key:
             continue
         idx += 1
@@ -540,7 +617,7 @@ def run_merge(
             missing.append(disp)
             if not cfg.include_only_in_2:
                 continue
-            src1_dict = {cfg.match_col1: disp}
+            src1_dict = dict(zip(cols1, parts))
         else:
             if not cfg.include_matched:
                 continue
@@ -555,7 +632,7 @@ def run_merge(
         _p(88, 100, "找出來源 2 沒列到的資料…")
         seen1: set[str] = set()
         for r1 in t1.rows:
-            disp, key = _key_pair(r1[match_idx] if match_idx < len(r1) else None, ic)
+            disp, key, parts = _row_key(r1, idx1, ic)
             if not key or key in keys2:
                 continue
             if key in seen1 and cfg.drop_duplicates:
@@ -563,7 +640,7 @@ def run_merge(
             seen1.add(key)
             only_in_1.append(disp)
             src1_dict = {c: (r1[j] if j < len(r1) else None) for j, c in enumerate(t1.columns)}
-            src2_dict = {cfg.filter_col2: disp}
+            src2_dict = dict(zip(cols2, parts))
             out_rows.append(_build_row(src1_dict, src2_dict))
 
     _p(95, 100, "建立輸出表…")
@@ -590,7 +667,7 @@ def _is_src1_copy(col: OutputColumn, src1_columns: set[str]) -> bool:
     return ref in src1_columns
 
 
-def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row) -> MergeResult:
+def _run_keep_all_src1(cfg, t1, t2, idx1, idx2, cols2, total, _p, _build_row) -> MergeResult:
     """來源 1 每列都輸出(照原順序);被篩選到的列才填來源 2 / 自訂欄位。
 
     被篩選到 = 有對應到來源 2(預設),勾「篩選沒有對應資料」時 = 沒對應到。
@@ -601,7 +678,7 @@ def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row
     # 來源 2 key → 第一筆列
     lookup2: dict[str, list] = {}
     for r2 in t2.rows:
-        _, k = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        _, k, _ = _row_key(r2, idx2, ic)
         if k and k not in lookup2:
             lookup2[k] = r2
 
@@ -618,7 +695,7 @@ def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row
     for i, r1 in enumerate(t1.rows, 1):
         if i % step == 0:
             _p(45 + int(40 * i / n), 100, f"處理中 {i}/{n}")
-        disp, key = _key_pair(r1[match_idx] if match_idx < len(r1) else None, ic)
+        disp, key, parts = _row_key(r1, idx1, ic)
         if key:
             keys1.add(key)
         r2 = lookup2.get(key) if key else None
@@ -633,7 +710,7 @@ def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row
         if r2 is not None:
             src2_dict = {c: (r2[j] if j < len(r2) else None) for j, c in enumerate(t2.columns)}
         else:
-            src2_dict = {cfg.filter_col2: disp}
+            src2_dict = dict(zip(cols2, parts))
         full = _build_row(src1_dict, src2_dict)
         out_rows.append([v if (selected or always[j]) else "" for j, v in enumerate(full)])
 
@@ -641,7 +718,7 @@ def _run_keep_all_src1(cfg, t1, t2, match_idx, filter_idx, total, _p, _build_row
     missing: list[str] = []
     seen_m: set[str] = set()
     for r2 in t2.rows:
-        disp, k = _key_pair(r2[filter_idx] if filter_idx < len(r2) else None, ic)
+        disp, k, _ = _row_key(r2, idx2, ic)
         if k and k not in keys1 and k not in seen_m:
             seen_m.add(k)
             missing.append(disp)

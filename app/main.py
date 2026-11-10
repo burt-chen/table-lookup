@@ -755,6 +755,103 @@ class MappingTable(ttk.Frame):
             self._on_changed_cb()
 
 
+class KeyPairsEditor(ttk.Frame):
+    """比對欄位組:每列「來源 1 欄位 ↔ 來源 2 欄位」,可新增 / 刪除,至少保留一組。
+
+    所有組都相同才算對應(多欄合起來當一個 key)。
+    """
+
+    def __init__(self, parent, on_changed=None):
+        super().__init__(parent)
+        self._on_changed_cb = on_changed
+        self._cols1: list[str] = []
+        self._cols2: list[str] = []
+        self._rows: list[dict] = []
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(2, weight=1)
+        ttk.Label(self, text="來源 1 欄位").grid(row=0, column=0, sticky="w", padx=6)
+        ttk.Label(self, text="來源 2 欄位").grid(row=0, column=2, sticky="w", padx=6)
+        self._body = ttk.Frame(self)
+        self._body.grid(row=1, column=0, columnspan=4, sticky="ew")
+        self._body.columnconfigure(0, weight=1)
+        self._body.columnconfigure(2, weight=1)
+        bottom = ttk.Frame(self)
+        bottom.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        ttk.Button(bottom, text="+ 新增比對欄位", command=self._on_add).pack(side="left", padx=6)
+        ttk.Label(bottom, text="多組時,所有組都相同才算對應", foreground="#b26a00").pack(side="left")
+        self._add_row()
+
+    # ---- rows ----
+
+    def _changed(self):
+        if self._on_changed_cb:
+            self._on_changed_cb()
+
+    def _add_row(self, c1: str = "", c2: str = "") -> None:
+        v1, v2 = tk.StringVar(value=c1), tk.StringVar(value=c2)
+        cb1 = ttk.Combobox(self._body, textvariable=v1, state="readonly", values=self._cols1)
+        arrow = ttk.Label(self._body, text="↔")
+        cb2 = ttk.Combobox(self._body, textvariable=v2, state="readonly", values=self._cols2)
+        row: dict = {"v1": v1, "v2": v2, "widgets": [cb1, arrow, cb2]}
+        btn = ttk.Button(self._body, text="✕", width=3, command=lambda: self._remove_row(row))
+        row["widgets"].append(btn)
+        row["btn"] = btn
+        for v in (v1, v2):
+            v.trace_add("write", lambda *_: self._changed())
+        self._rows.append(row)
+        self._regrid()
+
+    def _remove_row(self, row: dict) -> None:
+        if len(self._rows) <= 1:
+            return
+        for w in row["widgets"]:
+            w.destroy()
+        self._rows.remove(row)
+        self._regrid()
+        self._changed()
+
+    def _regrid(self) -> None:
+        only_one = len(self._rows) <= 1
+        for r, row in enumerate(self._rows):
+            cb1, arrow, cb2, btn = row["widgets"]
+            cb1.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+            arrow.grid(row=r, column=1, padx=2)
+            cb2.grid(row=r, column=2, sticky="ew", padx=6, pady=2)
+            btn.grid(row=r, column=3, padx=(0, 6))
+            btn.configure(state="disabled" if only_one else "normal")
+
+    def _on_add(self) -> None:
+        self._add_row()
+        self._changed()
+
+    # ---- public API ----
+
+    def set_source_columns(self, idx: int, cols: list[str]) -> None:
+        """來源載入後更新下拉選項;第一組若選的欄位不存在就預設第一欄,其餘組清空。"""
+        if idx == 1:
+            self._cols1 = cols
+        else:
+            self._cols2 = cols
+        key = "v1" if idx == 1 else "v2"
+        for i, row in enumerate(self._rows):
+            row["widgets"][0 if idx == 1 else 2].configure(values=cols)
+            if row[key].get() not in cols:
+                row[key].set(cols[0] if (cols and i == 0) else "")
+
+    def get_pairs(self) -> list[list[str]]:
+        return [[row["v1"].get(), row["v2"].get()] for row in self._rows]
+
+    def set_pairs(self, pairs) -> None:
+        pairs = [list(p) for p in pairs] or [["", ""]]
+        for row in list(self._rows):
+            for w in row["widgets"]:
+                w.destroy()
+        self._rows.clear()
+        for c1, c2 in pairs:
+            self._add_row(c1, c2)
+        self._changed()
+
+
 class PreviewTable(ttk.Frame):
     """Read-only data preview using ttk.Treeview.
 
@@ -978,17 +1075,9 @@ class MainWindow:
 
         match_box = ttk.LabelFrame(page, text="比對設定")
         match_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        match_box.columnconfigure(1, weight=1)
-        ttk.Label(match_box, text="來源 1 比對欄位:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        self.match_col1_var = tk.StringVar()
-        self.match_col1_cb = ttk.Combobox(match_box, textvariable=self.match_col1_var, state="readonly", values=[])
-        self.match_col1_cb.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Label(match_box, text="來源 2 提供 key 的欄位:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        self.filter_col2_var = tk.StringVar()
-        self.filter_col2_cb = ttk.Combobox(match_box, textvariable=self.filter_col2_var, state="readonly", values=[])
-        self.filter_col2_cb.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 6))
-        for var in (self.match_col1_var, self.filter_col2_var):
-            var.trace_add("write", lambda *_: self._invalidate_preview())
+        match_box.columnconfigure(0, weight=1)
+        self.key_pairs = KeyPairsEditor(match_box, on_changed=self._invalidate_preview)
+        self.key_pairs.grid(row=0, column=0, sticky="ew", pady=4)
 
         scope_box = ttk.LabelFrame(page, text="比對選項")
         scope_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1152,17 +1241,12 @@ class MainWindow:
         if idx == 1:
             self._df1 = df
             self._cols1 = cols
-            self.match_col1_cb.configure(values=cols)
-            if self.match_col1_var.get() not in cols:
-                self.match_col1_var.set(cols[0] if cols else "")
             self.preview_src1.show_df(df)
         else:
             self._df2 = df
             self._cols2 = cols
-            self.filter_col2_cb.configure(values=cols)
-            if self.filter_col2_var.get() not in cols:
-                self.filter_col2_var.set(cols[0] if cols else "")
             self.preview_src2.show_df(df)
+        self.key_pairs.set_source_columns(idx, cols)
         self.mapping.set_source_columns(self._cols1, self._cols2)
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -1272,8 +1356,7 @@ class MainWindow:
         cfg = MergeConfig(
             file1=self.picker1.path(), sheet1=self.picker1.sheet(),
             file2=self.picker2.path(), sheet2=self.picker2.sheet(),
-            match_col1=self.match_col1_var.get(),
-            filter_col2=self.filter_col2_var.get(),
+            key_pairs=self.key_pairs.get_pairs(),
             drop_duplicates=True,
             include_matched=not self.only_missing_var.get(),
             include_only_in_2=False,
@@ -1282,12 +1365,13 @@ class MainWindow:
             keep_all_src1=self.range_var.get() == RANGE_ALL_SRC1,
             outputs=self.mapping.get_columns(),
         )
-        if not cfg.match_col1:
-            messagebox.showwarning("缺少設定", "請選擇來源 1 的比對欄位")
-            return None
-        if not cfg.filter_col2:
-            messagebox.showwarning("缺少設定", "請選擇來源 2 的 key 欄位")
-            return None
+        for n, (c1, c2) in enumerate(cfg.pairs(), 1):
+            if not c1:
+                messagebox.showwarning("缺少設定", f"請選擇第 {n} 組比對欄位的來源 1 欄位")
+                return None
+            if not c2:
+                messagebox.showwarning("缺少設定", f"請選擇第 {n} 組比對欄位的來源 2 欄位")
+                return None
         if not cfg.outputs:
             messagebox.showwarning("缺少設定", "請至少新增一個輸出欄位")
             return None
@@ -1301,13 +1385,13 @@ class MainWindow:
             return
         blocked = 2 if allowed == {1} else 1
         # 比對欄位本身仍拿得到值(就是 key),不算問題
-        key_col = cfg.filter_col2 if blocked == 2 else cfg.match_col1
+        key_cols = {p[1] if blocked == 2 else p[0] for p in cfg.pairs()}
         bad: list[str] = []
         for col in cfg.outputs:
             refs = template_columns(col.value) if col.mode == "template" else [col.value]
             for ref in refs:
                 ref = (ref or "").strip()
-                if ref.startswith(f"{blocked}.") and ref[2:] != key_col:
+                if ref.startswith(f"{blocked}.") and ref[2:] not in key_cols:
                     bad.append(f"{col.name} → {{{ref}}}")
         if bad:
             self._log(
@@ -1409,8 +1493,7 @@ class MainWindow:
         cfg = MergeConfig(
             file1=self.picker1.path(), sheet1=self.picker1.sheet(),
             file2=self.picker2.path(), sheet2=self.picker2.sheet(),
-            match_col1=self.match_col1_var.get(),
-            filter_col2=self.filter_col2_var.get(),
+            key_pairs=self.key_pairs.get_pairs(),
             drop_duplicates=True,
             include_matched=not self.only_missing_var.get(),
             include_only_in_2=False,
@@ -1456,10 +1539,8 @@ class MainWindow:
         if cfg.file2 and Path(cfg.file2).exists():
             self.picker2.set_path(cfg.file2)
             self.picker2.set_sheet(cfg.sheet2)
-        if cfg.match_col1:
-            self.match_col1_var.set(cfg.match_col1)
-        if cfg.filter_col2:
-            self.filter_col2_var.set(cfg.filter_col2)
+        if cfg.pairs():
+            self.key_pairs.set_pairs(cfg.pairs())
         # 勾選狀態要先套用,新建的欄位列才會拿到正確的來源限制
         self.only_missing_var.set(cfg.include_only_in_1)
         self.range_var.set(RANGE_ALL_SRC1 if cfg.keep_all_src1 else RANGE_FILTERED)
